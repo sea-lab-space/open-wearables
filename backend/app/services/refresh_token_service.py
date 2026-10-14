@@ -160,5 +160,19 @@ class RefreshTokenService:
         self.logger.debug(f"Revoked refresh token {refresh_token_str[:10]}...")
         return True
 
+    def revoke_all_for_user(self, db_session: DbSession, user_id: UUID) -> int:
+        """Revoke every refresh token for a user, unpairing all their SDK clients.
+
+        Revoking a single token cannot do this. Refresh tokens rotate on every
+        use, so whoever issued the original pairing no longer holds the token
+        that is currently live; only a sweep by user reaches it.
+
+        Returns:
+            The number of tokens revoked.
+        """
+        count = self.repo.revoke_all_for_user(db_session, user_id)
+        self.logger.info(f"Revoked {count} refresh tokens for user {user_id}")
+        return count
+
 
 refresh_token_service = RefreshTokenService(log=getLogger(__name__))

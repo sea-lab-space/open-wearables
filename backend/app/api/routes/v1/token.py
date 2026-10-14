@@ -1,8 +1,10 @@
+from uuid import UUID
+
 from fastapi import APIRouter, status
 
 from app.database import DbSession
 from app.schemas.auth import RefreshTokenRequest, TokenResponse
-from app.services import refresh_token_service
+from app.services import ApiKeyDep, refresh_token_service
 
 router = APIRouter()
 
@@ -50,3 +52,27 @@ def revoke_refresh_token(
         404: If the refresh token is not found
     """
     refresh_token_service.revoke_token(db, payload.refresh_token)
+
+
+@router.post("/users/{user_id}/tokens/revoke")
+def revoke_user_tokens(
+    user_id: UUID,
+    db: DbSession,
+    _api_key: ApiKeyDep,
+) -> dict[str, int]:
+    """Revoke every refresh token for a user, unpairing all their SDK clients.
+
+    This is the endpoint to call when someone loses a phone or wants to stop a
+    paired device from uploading. /token/revoke cannot serve that purpose: it
+    needs the token that is currently live, and rotation means the party who
+    issued the pairing no longer has it.
+
+    Args:
+        user_id: OpenWearables User ID (UUID)
+        db: Database session
+
+    Returns:
+        The number of tokens revoked. Zero is a success, not an error: it means
+        the user had no active pairings.
+    """
+    return {"revoked": refresh_token_service.revoke_all_for_user(db, user_id)}
