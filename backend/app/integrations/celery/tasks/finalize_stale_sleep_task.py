@@ -12,6 +12,7 @@ from app.services.sdk.sleep_service import (
     active_users_key,
     finish_sleep,
     load_sleep_state,
+    writers_key,
 )
 from app.utils.sentry_helpers import log_and_capture_error
 
@@ -32,16 +33,20 @@ def finalize_stale_sleeps() -> None:
                     continue
 
                 try:
-                    state = load_sleep_state(user_id)
-                    if not state:
-                        continue
+                    # One state per writer, plus any state saved before sleep was tracked per writer.
+                    states = [load_sleep_state(user_id)]
+                    writers = list(redis_client.sscan_iter(writers_key(user_id)))
+                    states += [load_sleep_state(user_id, writer) for writer in writers]
+                    for state in states:
+                        if not state:
+                            continue
 
-                    end_time = state.end_time
-                    if end_time.tzinfo is None:
-                        end_time = end_time.replace(tzinfo=timezone.utc)
+                        end_time = state.end_time
+                        if end_time.tzinfo is None:
+                            end_time = end_time.replace(tzinfo=timezone.utc)
 
-                    if now - end_time >= timedelta(minutes=settings.sleep_end_gap_minutes):
-                        finish_sleep(db, user_id, state)
+                        if now - end_time >= timedelta(minutes=settings.sleep_end_gap_minutes):
+                            finish_sleep(db, user_id, state)
                 finally:
                     with contextlib.suppress(Exception):
                         lock.release()

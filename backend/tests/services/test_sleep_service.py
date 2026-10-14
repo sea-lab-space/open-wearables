@@ -9,7 +9,7 @@ Apple Watch sleep data patterns:
 - Newer Apple Watch (watchOS 9+): "in_bed", "awake", "light", "deep", "rem" stages
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -17,6 +17,8 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.constants.sleep import SleepStageType
+from app.integrations.redis_client import get_redis_client
+from app.models import DataSource, EventRecord
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -30,7 +32,13 @@ from app.services.sdk.sleep_service import (
     _calculate_final_metrics,
     finish_sleep,
     handle_sleep_data,
+    key,
+    load_sleep_state,
+    save_sleep_state,
+    writer_id,
+    writers_key,
 )
+from tests.factories import UserFactory
 
 
 def _dt(iso: str) -> datetime:
@@ -292,8 +300,11 @@ class TestCalculateFinalMetrics:
         assert metrics["in_bed_seconds"] == 0
         assert cleaned == []
 
-    def test_only_in_bed_treated_as_sleeping(self) -> None:
-        """When only in_bed stages exist (no sleep phases), treat in_bed as sleeping."""
+    def test_only_in_bed_is_not_sleep(self) -> None:
+        """When only in_bed stages exist (no sleep phases), nothing counts as asleep.
+
+        An iPhone with a sleep schedule writes in_bed for its bedtime window on its own.
+        """
         stages = [
             SleepStateStage(
                 stage=SleepStageType.IN_BED,
@@ -304,16 +315,13 @@ class TestCalculateFinalMetrics:
 
         metrics, cleaned = _calculate_final_metrics(stages)
 
-        # in_bed should be converted to sleeping
-        assert metrics["sleeping_seconds"] == 7.5 * 3600
+        assert metrics["sleeping_seconds"] == 0
         assert metrics["deep_seconds"] == 0
         assert metrics["light_seconds"] == 0
         assert metrics["rem_seconds"] == 0
         # in_bed_seconds still calculated from original in_bed intervals
         assert metrics["in_bed_seconds"] == 7.5 * 3600
-        # Hypnogram should show sleeping, not in_bed
-        assert len(cleaned) == 1
-        assert cleaned[0].stage == SleepStageType.SLEEPING
+        assert cleaned == []
 
     def test_detailed_plus_sleeping_wrapper_excludes_sleeping(self) -> None:
         """When detailed phases + sleeping wrapper coexist, sleeping is dropped."""
@@ -544,7 +552,7 @@ class TestHandleSleepDataIntegration:
         Modeled after older Apple Watch pattern:
         - 3 sleeping segments (Watch3,3)
         - 1 in_bed segment (iPhone15,2)
-        All within gap threshold → single session.
+        The watch and the iPhone are two writers → two sessions.
         """
         user_id = str(uuid4())
 
@@ -568,10 +576,13 @@ class TestHandleSleepDataIntegration:
         # The finalize task should be dispatched
         mock_finalize.delay.assert_called_once()
 
-        # Verify saved state: grab the last set() call's value
-        last_set_call = mock_redis.set.call_args_list[-1]
-        state_json = last_set_call[0][1]  # second positional arg
-        state = SleepState.model_validate_json(state_json)
+        # Verify saved states: one per writer
+        states = {
+            state.device_model: state
+            for state in (SleepState.model_validate_json(call[0][1]) for call in mock_redis.set.call_args_list)
+        }
+        assert set(states) == {"Watch3,3", "iPhone15,2"}
+        state = states["Watch3,3"]
 
         # sleeping_seconds should be populated, NOT deep_seconds
         assert state.sleeping_seconds > 0
@@ -579,11 +590,11 @@ class TestHandleSleepDataIntegration:
         assert state.light_seconds == 0
         assert state.rem_seconds == 0
 
-        # All entries are within the gap threshold so they merge into one session.
+        # The watch's entries are within the gap threshold so they merge into one session;
+        # the iPhone's in_bed is a session of its own.
         sleeping_stages = [s for s in state.stages if s.stage == SleepStageType.SLEEPING]
-        in_bed_stages = [s for s in state.stages if s.stage == SleepStageType.IN_BED]
         assert len(sleeping_stages) >= 1
-        assert len(in_bed_stages) == 1
+        assert [s.stage for s in states["iPhone15,2"].stages] == [SleepStageType.IN_BED]
 
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
     @patch("app.services.sdk.sleep_service.event_record_service")
@@ -702,7 +713,7 @@ class TestNoIntermediateRedisSaves:
         mock_finalize: MagicMock,
         db: Session,
     ) -> None:
-        """Redis .set() should be called exactly once after processing all stages."""
+        """Redis .set() should be called once per writer after processing all stages."""
         user_id = str(uuid4())
 
         mock_redis = MagicMock()
@@ -719,18 +730,19 @@ class TestNoIntermediateRedisSaves:
         handle_sleep_data(db, request, user_id)
 
         # Count how many times set() was called (each call = one Redis state save).
-        # With the fix, this should be exactly 1 — after the loop finishes.
+        # With the fix, this should be once per writer (the iPhone's in_bed and the
+        # watch's stages) — after the loop finishes.
         # Before the fix, it was called once per stage (9 times for this payload).
         set_calls = mock_redis.set.call_args_list
-        assert len(set_calls) == 1, (
-            f"Expected exactly 1 Redis save per batch, got {len(set_calls)}. "
+        assert len(set_calls) == 2, (
+            f"Expected exactly 1 Redis save per writer, got {len(set_calls)}. "
             "Intermediate saves expose partial state to finalize_stale_sleeps."
         )
+        assert len({call[0][0] for call in set_calls}) == 2
 
-        # Verify the single saved state contains ALL stages from the payload
-        state = SleepState.model_validate_json(set_calls[0][0][1])
-        # The payload has 9 stages; in_bed is included but counted under in_bed_seconds
-        assert len(state.stages) >= 8  # at least the 8 watch stages + 1 in_bed
+        # Verify the watch's saved state contains ALL its stages from the payload
+        state = SleepState.model_validate_json(set_calls[-1][0][1])
+        assert len(state.stages) == 8
 
 
 class TestHistoricalBulkUploadMerging:
@@ -839,3 +851,180 @@ class TestHistoricalBulkUploadMerging:
         assert SleepStageType.LIGHT in stage_types
         assert SleepStageType.DEEP in stage_types
         assert SleepStageType.REM in stage_types
+
+
+WATCH = {"name": "Jan’s Apple Watch", "deviceModel": "Watch7,1", "deviceType": "watch"}
+GOOGLE_HEALTH = {"name": "Google Health", "productType": "iPhone16,2", "deviceType": "phone"}
+IPHONE = {"name": "JAN", "productType": "iPhone16,2", "deviceType": "phone"}
+
+
+def _payload(*samples: tuple[str, datetime, datetime, dict]) -> SyncRequest:
+    return SyncRequest.model_validate(
+        {
+            "provider": "apple",
+            "sdkVersion": "1.0.0",
+            "syncTimestamp": datetime.now(timezone.utc).isoformat(),
+            "data": {
+                "records": [],
+                "workouts": [],
+                "sleep": [
+                    {
+                        "id": str(uuid4()),
+                        "stage": stage,
+                        "startDate": start.isoformat(),
+                        "endDate": end.isoformat(),
+                        "source": source,
+                    }
+                    for stage, start, end, source in samples
+                ],
+            },
+        }
+    )
+
+
+def _sessions(db: Session, user_id: str) -> dict[str | None, EventRecord]:
+    """The user's stored sleep sessions, by the writer they are credited to."""
+    records = (
+        db.query(EventRecord)
+        .join(DataSource, EventRecord.data_source_id == DataSource.id)
+        .filter(DataSource.user_id == user_id, EventRecord.category == "sleep")
+        .all()
+    )
+    return {record.source_name: record for record in records}
+
+
+@patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+class TestSleepPerWriter:
+    """Each writer's samples make sessions of their own, tracked in a Redis state per writer.
+
+    Uses the test Redis and database rather than mocks, so states and stored sessions are real.
+    """
+
+    def test_overlapping_writers_give_one_session_each(self, mock_finalize: MagicMock, db: Session) -> None:
+        """An Apple Watch and the Google Health app recording the same night are two sessions."""
+        user_id = str(UserFactory().id)
+        night = datetime(2026, 3, 10, 23, 0, tzinfo=timezone.utc)
+
+        handle_sleep_data(
+            db,
+            _payload(
+                ("deep", night, night + timedelta(hours=2), WATCH),
+                ("light", night + timedelta(hours=2), night + timedelta(hours=4), WATCH),
+                ("light", night - timedelta(minutes=30), night + timedelta(hours=1), GOOGLE_HEALTH),
+                ("deep", night + timedelta(hours=1), night + timedelta(hours=3, minutes=30), GOOGLE_HEALTH),
+            ),
+            user_id,
+        )
+
+        sessions = _sessions(db, user_id)
+        assert set(sessions) == {"Jan’s Apple Watch", "Google Health"}
+
+        watch = sessions["Jan’s Apple Watch"]
+        assert (watch.start_datetime, watch.end_datetime) == (night, night + timedelta(hours=4))
+        assert watch.sleep_detail.sleep_deep_minutes == 120
+        assert watch.sleep_detail.sleep_light_minutes == 120
+
+        google = sessions["Google Health"]
+        assert (google.start_datetime, google.end_datetime) == (
+            night - timedelta(minutes=30),
+            night + timedelta(hours=3, minutes=30),
+        )
+        assert google.sleep_detail.sleep_light_minutes == 90
+        assert google.sleep_detail.sleep_deep_minutes == 150
+
+    def test_later_payload_extends_only_its_writers_session(self, mock_finalize: MagicMock, db: Session) -> None:
+        """A night in progress: each writer's next payload extends that writer's state alone."""
+        user_id = str(UserFactory().id)
+        # Ends within the 2-hour gap, so no state is finished yet.
+        start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=150)
+        watch = writer_id("Jan’s Apple Watch", "Watch7,1")
+        google = writer_id("Google Health", "iPhone16,2")
+
+        handle_sleep_data(
+            db,
+            _payload(
+                ("light", start, start + timedelta(hours=1), WATCH),
+                ("light", start, start + timedelta(hours=1), GOOGLE_HEALTH),
+            ),
+            user_id,
+        )
+        handle_sleep_data(
+            db, _payload(("deep", start + timedelta(hours=1), start + timedelta(hours=2), WATCH)), user_id
+        )
+
+        watch_state = load_sleep_state(user_id, watch)
+        google_state = load_sleep_state(user_id, google)
+        assert watch_state is not None
+        assert google_state is not None
+        assert (watch_state.end_time, watch_state.deep_seconds) == (start + timedelta(hours=2), 3600)
+        assert (google_state.end_time, google_state.deep_seconds) == (start + timedelta(hours=1), 0)
+
+        handle_sleep_data(
+            db, _payload(("rem", start + timedelta(hours=1), start + timedelta(minutes=150), GOOGLE_HEALTH)), user_id
+        )
+
+        watch_state = load_sleep_state(user_id, watch)
+        google_state = load_sleep_state(user_id, google)
+        assert watch_state is not None
+        assert google_state is not None
+        assert (watch_state.end_time, watch_state.rem_seconds) == (start + timedelta(hours=2), 0)
+        assert (google_state.end_time, google_state.rem_seconds) == (start + timedelta(minutes=150), 5400)
+        assert _sessions(db, user_id) == {}
+
+    def test_in_bed_only_is_a_session_with_no_sleep(self, mock_finalize: MagicMock, db: Session) -> None:
+        """An iPhone's bedtime window on its own is time in bed, not time asleep."""
+        user_id = str(UserFactory().id)
+        night = datetime(2026, 3, 10, 22, 30, tzinfo=timezone.utc)
+
+        handle_sleep_data(db, _payload(("in_bed", night, night + timedelta(hours=8), IPHONE)), user_id)
+
+        session = _sessions(db, user_id)["JAN"]
+        assert session.sleep_detail.sleep_total_duration_minutes == 0
+        assert session.sleep_detail.sleep_time_in_bed_minutes == 8 * 60
+
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    def test_finish_sleep_deletes_only_its_own_state(
+        self, mock_event_service: MagicMock, mock_finalize: MagicMock, db: Session
+    ) -> None:
+        """Finishing one writer's session, or a state saved before states were kept per writer,
+        leaves every other state in place."""
+        user_id = str(uuid4())
+        mock_event_service.find_adjacent_sleep_record.return_value = None
+        at = datetime(2026, 3, 10, 23, 0, tzinfo=timezone.utc)
+        redis = get_redis_client()
+
+        def state(source_name: str, device_model: str, writer: str | None) -> SleepState:
+            return SleepState(
+                uuid=str(uuid4()),
+                source_name=source_name,
+                device_model=device_model,
+                provider="apple",
+                writer=writer,
+                start_time=at,
+                end_time=at + timedelta(hours=1),
+                last_start_timestamp=at,
+                last_end_timestamp=at + timedelta(hours=1),
+                light_seconds=3600,
+                stages=[SleepStateStage(stage=SleepStageType.LIGHT, start_time=at, end_time=at + timedelta(hours=1))],
+            )
+
+        watch = state("Jan’s Apple Watch", "Watch7,1", writer_id("Jan’s Apple Watch", "Watch7,1"))
+        google = state("Google Health", "iPhone16,2", writer_id("Google Health", "iPhone16,2"))
+        save_sleep_state(user_id, watch)
+        save_sleep_state(user_id, google)
+        # A state saved before this change: under the user's own key, with no writer.
+        legacy = state("Jan’s Apple Watch", "Watch7,1", None)
+        redis.set(key(user_id), legacy.model_dump_json())
+
+        finish_sleep(db, user_id, legacy)
+        assert not redis.exists(key(user_id))
+        assert redis.smembers(writers_key(user_id)) == {watch.writer, google.writer}
+
+        finish_sleep(db, user_id, watch)
+        assert load_sleep_state(user_id, watch.writer) is None
+        assert load_sleep_state(user_id, google.writer) == google
+        assert redis.sismember("sleep:active_users", user_id)
+
+        finish_sleep(db, user_id, google)
+        assert not redis.exists(writers_key(user_id))
+        assert not redis.sismember("sleep:active_users", user_id)

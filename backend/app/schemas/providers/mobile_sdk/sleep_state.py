@@ -20,6 +20,9 @@ class SleepState(BaseModel):
     device_model: str | None = None
     provider: str | None = None
     zone_offset: str | None = None
+    # The writer whose samples this state holds (see sleep_service.writer_id). None for a
+    # state saved while one state per user held every writer's samples.
+    writer: str | None = None
 
     start_time: datetime
     end_time: datetime

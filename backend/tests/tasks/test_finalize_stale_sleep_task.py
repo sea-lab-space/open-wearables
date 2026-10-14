@@ -12,7 +12,9 @@ from uuid import uuid4
 from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.finalize_stale_sleep_task import finalize_stale_sleeps
+from app.integrations.redis_client import get_redis_client
 from app.schemas.providers.mobile_sdk import SleepState
+from app.services.sdk.sleep_service import key, save_sleep_state, writer_id
 
 
 class TestFinalizeStaleSleepsTask:
@@ -366,3 +368,52 @@ class TestFinalizeStaleSleepsTask:
         # Assert
         assert result is None  # Task completes and skips the malformed user
         mock_load_state.assert_called_once_with(user_id)
+
+    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finish_sleep")
+    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.SessionLocal")
+    def test_finalize_stale_sleeps_finishes_every_writer(
+        self,
+        mock_session_local: MagicMock,
+        mock_finish_sleep: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        """Verify each of a user's writers is finalized once stale, using the test Redis."""
+        # Arrange
+        user_id = str(uuid4())
+        now = datetime.now(timezone.utc)
+
+        mock_session_local.return_value.__enter__ = MagicMock(return_value=db)
+        mock_session_local.return_value.__exit__ = MagicMock(return_value=None)
+
+        def state(source_name: str, device_model: str, ended: datetime, per_writer: bool = True) -> SleepState:
+            return SleepState(
+                uuid=str(uuid4()),
+                source_name=source_name,
+                device_model=device_model,
+                provider="apple",
+                writer=writer_id(source_name, device_model) if per_writer else None,
+                start_time=ended - timedelta(hours=6),
+                end_time=ended,
+                last_start_timestamp=ended - timedelta(hours=1),
+                last_end_timestamp=ended,
+                light_seconds=3600,
+                stages=[],
+            )
+
+        watch = state("Apple Watch", "Watch7,1", now - timedelta(hours=3))
+        google = state("Google Health", "iPhone16,2", now - timedelta(hours=2, minutes=30))
+        phone = state("iPhone", "iPhone16,2", now - timedelta(minutes=30))  # still recording
+        for writer_state in (watch, google, phone):
+            save_sleep_state(user_id, writer_state)
+        # A state saved before sleep was tracked per writer, under the user's own key.
+        legacy = state("Apple Watch", "Watch7,1", now - timedelta(hours=4), per_writer=False)
+        get_redis_client().set(key(user_id), legacy.model_dump_json())
+
+        # Act
+        finalize_stale_sleeps()
+
+        # Assert
+        finished = [call.args[2] for call in mock_finish_sleep.call_args_list]
+        assert sorted(finished, key=lambda s: s.uuid) == sorted([legacy, watch, google], key=lambda s: s.uuid)
+        assert all(call.args[:2] == (db, user_id) for call in mock_finish_sleep.call_args_list)
