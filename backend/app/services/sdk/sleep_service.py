@@ -20,6 +20,7 @@ from app.schemas.model_crud.activities import (
 )
 from app.schemas.providers.mobile_sdk import (
     SLEEP_START_STATES,
+    SleepRecord,
     SleepState,
     SleepStateStage,
 )
@@ -41,9 +42,20 @@ _STAGE_TO_METRIC: dict[str, str] = {
 }
 
 
-def key(user_id: str) -> str:
-    """Generate a key for the sleep state."""
-    return f"sleep:active:{user_id}"
+def key(user_id: str, writer: str | None = None) -> str:
+    """Generate a key for one writer's sleep state.
+
+    Without a writer, the key of the one state per user kept before sleep was tracked per
+    writer. Such a state is finished when stale and never extended.
+    """
+    if writer is None:
+        return f"sleep:active:{user_id}"
+    return f"sleep:active:{user_id}:{writer}"
+
+
+def writers_key(user_id: str) -> str:
+    """Generate a key for the writers with an active sleep state."""
+    return f"sleep:active_writers:{user_id}"
 
 
 def active_users_key() -> str:
@@ -51,9 +63,18 @@ def active_users_key() -> str:
     return "sleep:active_users"
 
 
-def load_sleep_state(user_id: str) -> SleepState | None:
+def writer_id(source_name: str | None, device_model: str | None) -> str:
+    """Identify the app or device that wrote a sleep sample.
+
+    Each writer's samples make sessions of their own: an Apple Watch and a sleep app on the
+    phone that both recorded one night give two sessions, each with its own stages.
+    """
+    return json.dumps([source_name or "unknown", device_model])
+
+
+def load_sleep_state(user_id: str, writer: str | None = None) -> SleepState | None:
     """Load the sleep state from Redis."""
-    sleep_state_key = key(user_id)
+    sleep_state_key = key(user_id, writer)
     state = get_redis_client().get(sleep_state_key)
     if not state:
         return None
@@ -72,14 +93,20 @@ def load_sleep_state(user_id: str) -> SleepState | None:
 
 
 def save_sleep_state(user_id: str, state: SleepState) -> None:
-    get_redis_client().set(key(user_id), state.model_dump_json())
-    get_redis_client().expire(key(user_id), settings.redis_sleep_ttl_seconds)
+    get_redis_client().set(key(user_id, state.writer), state.model_dump_json())
+    get_redis_client().expire(key(user_id, state.writer), settings.redis_sleep_ttl_seconds)
+    if state.writer is not None:
+        get_redis_client().sadd(writers_key(user_id), state.writer)
+        get_redis_client().expire(writers_key(user_id), settings.redis_sleep_ttl_seconds)
     get_redis_client().sadd(active_users_key(), user_id)
 
 
-def delete_sleep_state(user_id: str) -> None:
-    get_redis_client().delete(key(user_id))
-    get_redis_client().srem(active_users_key(), user_id)
+def delete_sleep_state(user_id: str, writer: str | None = None) -> None:
+    get_redis_client().delete(key(user_id, writer))
+    if writer is not None:
+        get_redis_client().srem(writers_key(user_id), writer)
+    if not get_redis_client().exists(key(user_id)) and not get_redis_client().scard(writers_key(user_id)):
+        get_redis_client().srem(active_users_key(), user_id)
 
 
 def _create_new_sleep_state(
@@ -90,6 +117,7 @@ def _create_new_sleep_state(
     source_name: str | None = None,
     device_model: str | None = None,
     zone_offset: str | None = None,
+    writer: str | None = None,
 ) -> SleepState:
     return SleepState(
         uuid=id or str(uuid4()),
@@ -97,6 +125,7 @@ def _create_new_sleep_state(
         device_model=device_model,
         provider=provider,
         zone_offset=zone_offset,
+        writer=writer,
         start_time=start_time,
         end_time=end_time,
         last_start_timestamp=start_time,
@@ -143,7 +172,9 @@ def _apply_transition(
 
     if delta_seconds > settings.sleep_end_gap_minutes * 60:
         finish_sleep(db_session, user_id, state)
-        state = _create_new_sleep_state(start_time, end_time, uuid, provider, source_name, device_model, zone_offset)
+        state = _create_new_sleep_state(
+            start_time, end_time, uuid, provider, source_name, device_model, zone_offset, state.writer
+        )
 
     if zone_offset and not state.zone_offset:
         state.zone_offset = zone_offset
@@ -193,6 +224,71 @@ def _apply_transition(
     return state
 
 
+def _handle_writer_sleep_data(
+    db_session: DbSession,
+    user_id: str,
+    writer: str,
+    samples: list[SleepRecord],
+    provider: str,
+) -> None:
+    """Run one writer's samples from a batch through that writer's sleep state."""
+    current_state = load_sleep_state(user_id, writer)
+
+    for sjson in samples:
+        # Extract device info
+        device_model, software_version, original_source_name = extract_device_info(sjson.source)
+
+        sleep_phase = get_apple_sleep_phase(sjson.stage)
+
+        if sleep_phase is None:
+            continue
+
+        if not current_state:
+            if sleep_phase not in SLEEP_START_STATES:
+                continue
+
+            current_state = _create_new_sleep_state(
+                sjson.startDate,
+                sjson.endDate,
+                sjson.id,
+                provider,
+                original_source_name,
+                device_model,
+                sjson.zoneOffset,
+                writer,
+            )
+
+        current_state = _apply_transition(
+            db_session,
+            user_id,
+            current_state,
+            sleep_phase,
+            sjson.startDate,
+            sjson.endDate,
+            provider,
+            sjson.id,
+            original_source_name,
+            device_model,
+            sjson.zoneOffset,
+        )
+
+    # Persist the accumulated state to Redis only once after processing the writer's samples
+    if current_state:
+        save_sleep_state(user_id, current_state)
+
+    # Finalise synchronously if the session is already stale.  Historical
+    # uploads have end_time far in the past so this fires immediately, but
+    # finish_sleep now merges the result with any adjacent record already in
+    # the DB — so each payload extends the growing record rather than
+    # creating a separate session.
+    if current_state:
+        session_end = current_state.end_time
+        if session_end.tzinfo is None:
+            session_end = session_end.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - session_end >= timedelta(minutes=settings.sleep_end_gap_minutes):
+            finish_sleep(db_session, user_id, current_state)
+
+
 def handle_sleep_data(
     db_session: DbSession,
     request: SDKSyncRequest,
@@ -222,11 +318,12 @@ def handle_sleep_data(
     Flow:
         - Acquire a per-user Redis lock to prevent concurrent state corruption
         - Deduplicate incoming data based on start/end/stage/source
+        - Group it by writer (source name and device model); each writer has its own session
         - If no active session exists: Create new session in Redis (only for valid start states)
         - If active session exists: Check gap between new sample and the session window
           * Gap > 2 hours: Finalize existing session, start new one
           * Otherwise: Accumulate sleep stage durations in existing session
-        - Persist state once after the whole batch; dispatch the stale-sleep task
+        - Persist each writer's state once per batch; dispatch the stale-sleep task
     """
     redis_client = get_redis_client()
     lock = redis_client.lock(f"sleep:lock:{user_id}", timeout=30, blocking_timeout=15)
@@ -237,7 +334,6 @@ def handle_sleep_data(
             logger.warning("Could not acquire sleep processing lock for user %s; skipping batch", user_id)
             return
 
-        current_state = load_sleep_state(user_id)
         provider = request.provider
 
         # Deduplicate and sort
@@ -257,58 +353,15 @@ def handle_sleep_data(
                 seen.add(key_tuple)
                 unique_data.append(item)
 
+        # Each writer's samples run through a state of their own, so an Apple Watch and a
+        # sleep app on the phone that recorded the same night give two sessions.
+        by_writer: dict[str, list[SleepRecord]] = {}
         for sjson in unique_data:
-            # Extract device info
-            device_model, software_version, original_source_name = extract_device_info(sjson.source)
+            device_model, _, original_source_name = extract_device_info(sjson.source)
+            by_writer.setdefault(writer_id(original_source_name, device_model), []).append(sjson)
 
-            sleep_phase = get_apple_sleep_phase(sjson.stage)
-
-            if sleep_phase is None:
-                continue
-
-            if not current_state:
-                if sleep_phase not in SLEEP_START_STATES:
-                    continue
-
-                current_state = _create_new_sleep_state(
-                    sjson.startDate,
-                    sjson.endDate,
-                    sjson.id,
-                    provider,
-                    original_source_name,
-                    device_model,
-                    sjson.zoneOffset,
-                )
-
-            current_state = _apply_transition(
-                db_session,
-                user_id,
-                current_state,
-                sleep_phase,
-                sjson.startDate,
-                sjson.endDate,
-                provider,
-                sjson.id,
-                original_source_name,
-                device_model,
-                sjson.zoneOffset,
-            )
-
-        # Persist the accumulated state to Redis only once after processing the entire batch
-        if current_state:
-            save_sleep_state(user_id, current_state)
-
-        # Finalise synchronously if the session is already stale.  Historical
-        # uploads have end_time far in the past so this fires immediately, but
-        # finish_sleep now merges the result with any adjacent record already in
-        # the DB — so each payload extends the growing record rather than
-        # creating a separate session.
-        if current_state:
-            session_end = current_state.end_time
-            if session_end.tzinfo is None:
-                session_end = session_end.replace(tzinfo=timezone.utc)
-            if datetime.now(timezone.utc) - session_end >= timedelta(minutes=settings.sleep_end_gap_minutes):
-                finish_sleep(db_session, user_id, current_state)
+        for writer, samples in by_writer.items():
+            _handle_writer_sleep_data(db_session, user_id, writer, samples, provider)
 
     finally:
         with contextlib.suppress(Exception):
@@ -339,21 +392,12 @@ def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[
     }
 
     # Determine processing strategy based on what stage types are present:
-    # - Only in_bed (no sleeping/light/deep/rem): treat in_bed as sleeping (legacy devices)
     # - Detailed phases present (light/deep/rem): use only detailed + awake, drop sleeping wrapper
-    # - Only sleeping (no detailed): use sleeping + awake as-is
+    # - Otherwise: use sleeping + awake as-is. Only in_bed (no sleeping/light/deep/rem) is no
+    #   sleep: an iPhone with a sleep schedule writes in_bed for its bedtime window on its own.
     has_detailed = any(s.stage in ("light", "deep", "rem") for s in stages)
-    has_sleep_data = any(s.stage in ("sleeping", "light", "deep", "rem") for s in stages)
 
-    if not has_sleep_data:
-        processable = [
-            SleepStateStage(stage=SleepStageType.SLEEPING, start_time=s.start_time, end_time=s.end_time)
-            if s.stage == "in_bed"
-            else s
-            for s in stages
-            if s.stage != "unknown"
-        ]
-    elif has_detailed:
+    if has_detailed:
         processable = [s for s in stages if s.stage not in ("in_bed", "sleeping", "unknown")]
     else:
         processable = [s for s in stages if s.stage not in ("in_bed", "unknown")]
@@ -527,7 +571,7 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         event_record_service.create_detail(db_session, detail_for_record, detail_type="sleep")
         # Delete from Redis only after a successful DB write so a transient error
         # keeps the session available for the next periodic finalization attempt.
-        delete_sleep_state(user_id)
+        delete_sleep_state(user_id, state.writer)
     except Exception as e:
         log_structured(
             logger,
