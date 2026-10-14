@@ -568,6 +568,8 @@ class DataPointSeriesRepository(
             query = query.filter(self.model.recorded_at >= start)
         if end is not None:
             query = query.filter(self.model.recorded_at < end)
+        if params.created_after is not None:
+            query = query.filter(self.model.created_at > params.created_after)
         if source_by_type is not None:
             query = query.filter(
                 tuple_(self.model.series_type_definition_id, self.model.data_source_id).in_(

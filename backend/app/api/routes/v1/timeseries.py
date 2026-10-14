@@ -31,11 +31,21 @@ def get_timeseries(
     device_model: str | None = None,
     data_source_id: UUID | None = None,
     filter_by_priority: bool = False,
+    created_after: Annotated[
+        str | None,
+        Query(
+            description="Only samples stored after this instant, whenever they were recorded: what arrived "
+            "since an earlier read. A phone that syncs late delivers samples older than any it sent before.",
+            examples=["2023-11-07T05:31:56Z"],
+            json_schema_extra={"format": "date-time"},
+        ),
+    ] = None,
 ) -> PaginatedResponse[TimeSeriesSample]:
     """Returns granular time series data (biometrics or activity)."""
     params = TimeSeriesQueryParams(
         start_datetime=parse_query_datetime(start_time),
         end_datetime=parse_query_end_datetime(end_time),
+        created_after=parse_query_datetime(created_after) if created_after else None,
         limit=limit,
         cursor=cursor,
         resolution=resolution,
