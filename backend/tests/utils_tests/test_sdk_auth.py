@@ -4,9 +4,10 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.services import refresh_token_service
 from app.services.sdk_token_service import create_sdk_user_token
 from app.utils.auth import get_current_developer, get_sdk_auth
-from tests.factories import ApiKeyFactory, DeveloperFactory
+from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
 
 
 class TestGetSDKAuth:
@@ -61,6 +62,55 @@ class TestGetSDKAuth:
 
         assert result.auth_type == "sdk_token"
         assert str(result.user_id) == user_id
+
+
+class TestSDKTokenAfterRevokingPairings:
+    """Revoking every pairing stops the user's unexpired SDK access tokens too."""
+
+    @pytest.mark.asyncio
+    async def test_live_pairing_accepts_token(self, db: Session) -> None:
+        user = UserFactory()
+        refresh_token_service.create_sdk_refresh_token(db, user.id, "app_123")
+        token = create_sdk_user_token("app_123", str(user.id))
+
+        result = await get_sdk_auth(db=db, token=token, x_open_wearables_api_key=None)
+
+        assert result.user_id == user.id
+
+    @pytest.mark.asyncio
+    async def test_revoked_pairings_refuse_unexpired_token(self, db: Session) -> None:
+        user = UserFactory()
+        refresh_token_service.create_sdk_refresh_token(db, user.id, "app_123")
+        token = create_sdk_user_token("app_123", str(user.id))
+        refresh_token_service.revoke_all_for_user(db, user.id)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_sdk_auth(db=db, token=token, x_open_wearables_api_key=None)
+
+        assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_pairing_again_accepts_token(self, db: Session) -> None:
+        user = UserFactory()
+        refresh_token_service.create_sdk_refresh_token(db, user.id, "app_123")
+        refresh_token_service.revoke_all_for_user(db, user.id)
+        refresh_token_service.create_sdk_refresh_token(db, user.id, "app_123")
+        token = create_sdk_user_token("app_123", str(user.id))
+
+        result = await get_sdk_auth(db=db, token=token, x_open_wearables_api_key=None)
+
+        assert result.user_id == user.id
+
+    @pytest.mark.asyncio
+    async def test_refreshing_keeps_the_pairing(self, db: Session) -> None:
+        """Rotation revokes the old refresh token but leaves the new one live."""
+        user = UserFactory()
+        first = refresh_token_service.create_sdk_refresh_token(db, user.id, "app_123")
+        rotated = refresh_token_service.refresh_token(db, first)
+
+        result = await get_sdk_auth(db=db, token=rotated.access_token, x_open_wearables_api_key=None)
+
+        assert result.user_id == user.id
 
 
 class TestSDKTokenBlockedFromDeveloperEndpoints:

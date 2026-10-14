@@ -55,6 +55,12 @@ class RefreshTokenRepository:
         db_session.commit()
         return result.rowcount or 0
 
+    def all_revoked_for_user(self, db_session: DbSession, user_id: UUID) -> bool:
+        """Whether the user has had refresh tokens and every one of them is revoked."""
+        tokens = select(self.model).where(self.model.user_id == user_id)
+        live = tokens.where(self.model.revoked_at.is_(None))
+        return bool(db_session.scalar(select(tokens.exists() & ~live.exists())))
+
     def revoke_all_for_developer(self, db_session: DbSession, developer_id: UUID) -> int:
         """Revoke all refresh tokens for a developer. Returns count of revoked tokens."""
         now = datetime.now(timezone.utc)

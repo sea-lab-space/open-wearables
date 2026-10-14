@@ -9,6 +9,7 @@ from app.config import settings
 from app.database import DbSession
 from app.models import Developer
 from app.repositories.developer_repository import DeveloperRepository
+from app.repositories.refresh_token_repository import refresh_token_repository
 from app.schemas.auth import SDKAuthContext
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
@@ -120,9 +121,17 @@ async def get_sdk_auth(
             )
             if payload.get("scope") == "sdk":
                 sub = payload.get("sub")
+                user_id = UUID(sub) if sub else None
+                # Revoking every pairing (POST /users/{id}/tokens/revoke) stops the user's phones
+                # now, not when their access tokens expire. A pairing is its refresh token.
+                if user_id and refresh_token_repository.all_revoked_for_user(db, user_id):
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="SDK token revoked",
+                    )
                 return SDKAuthContext(
                     auth_type="sdk_token",
-                    user_id=UUID(sub) if sub else None,
+                    user_id=user_id,
                     app_id=payload.get("app_id"),
                 )
         except JWTError:
