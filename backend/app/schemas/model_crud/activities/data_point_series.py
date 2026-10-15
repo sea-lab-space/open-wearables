@@ -65,6 +65,7 @@ class TimeSeriesQueryParams(SourceFilterParams):
 
     start_datetime: datetime | None = Field(None, description="Lower bound (inclusive) for recorded timestamp")
     end_datetime: datetime | None = Field(None, description="Upper bound (inclusive) for recorded timestamp")
+    created_after: datetime | None = Field(None, description="Lower bound (exclusive) for when OW stored the sample")
     limit: int = Field(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE, description="Maximum number of samples to return")
     cursor: str | None = Field(
         None,
