@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 # Rate limiting configuration (Garmin: 100 req / 60s window)
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 15.0  # Base delay for exponential backoff (seconds): 15s, 30s, 60s
+# A provider's passing outage, retried with the same backoff. Only GETs are retried, as
+# only they are safe to send twice. Google Health's API answers 503 now and then mid-backfill.
+RETRYABLE_SERVER_ERRORS = {502, 503, 504}
 
 
 def _get_valid_token(
@@ -199,6 +202,20 @@ def make_authenticated_request(
                     status_code=429,
                     detail=f"{provider_name.capitalize()} API error: {response.text}",
                 )
+
+            if response.status_code in RETRYABLE_SERVER_ERRORS and method.upper() == "GET" and attempt < MAX_RETRIES:
+                backoff_delay = RETRY_BASE_DELAY * (2**attempt)
+                log_structured(
+                    logger,
+                    "warning",
+                    f"Server error ({response.status_code}), retrying",
+                    provider_name=provider_name,
+                    attempt=attempt + 1,
+                    max_retries=MAX_RETRIES,
+                    backoff_delay=backoff_delay,
+                )
+                time.sleep(backoff_delay)
+                continue
 
             response.raise_for_status()
 
