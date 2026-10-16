@@ -76,6 +76,10 @@ class GoogleHealth247Data(Base247DataTemplate):
     # rollUp enforces windowSize * pageSize <= the data type's max range; list default page.
     MAX_PAGE_SIZE = 10_000
     LIST_PAGE_SIZE = 1_000
+    # Each metric is fetched and saved this many days at a time, so an error loses one chunk
+    # rather than the whole window, and memory holds one chunk's points. Heart rate alone can
+    # be ~37k points a day, so a 90-day backfill held ~3M before it saved any.
+    SAVE_CHUNK_DAYS = 7
 
     def __init__(self, oauth: BaseOAuthTemplate, connection_repo: UserConnectionRepository, api_base_url: str):
         super().__init__(provider_name="google_health", api_base_url=api_base_url, oauth=oauth)
@@ -108,24 +112,29 @@ class GoogleHealth247Data(Base247DataTemplate):
 
         if granularity_supported:
             for metric in METRICS:
-                # Confine each metric (fetch + write) to a savepoint so a failed write rolls
-                # back only that metric and leaves the transaction usable for the rest.
-                try:
-                    with db.begin_nested():
-                        if metric.use_list(granularity):
-                            samples = self._native_samples(db, user_id, metric, start_time, end_time)
-                        else:
-                            samples = self._rollup_samples(db, user_id, metric, start_time, end_time, granularity)
-                        counts = timeseries_service.bulk_create_samples(db, samples) if samples else None
-                    db.commit()
-                except Exception as e:
-                    db.rollback()
-                    self._log_metric_failure(metric.data_type, user_id, e)
-                    failures[metric.data_type] = str(e)
-                    continue
-                succeeded += 1
-                if counts is not None:
-                    results[metric.data_type] = counts
+                metric_counts: WriteCounts | None = None
+                for chunk_start, chunk_end in self._chunk_range(start_time, end_time, self.SAVE_CHUNK_DAYS):
+                    # Confine each chunk (fetch + write) to a savepoint so a failed write rolls
+                    # back only that chunk and leaves the transaction usable for the rest.
+                    try:
+                        with db.begin_nested():
+                            if metric.use_list(granularity):
+                                samples = self._native_samples(db, user_id, metric, chunk_start, chunk_end)
+                            else:
+                                samples = self._rollup_samples(db, user_id, metric, chunk_start, chunk_end, granularity)
+                            counts = timeseries_service.bulk_create_samples(db, samples) if samples else None
+                        db.commit()
+                    except Exception as e:
+                        db.rollback()
+                        self._log_metric_failure(metric.data_type, user_id, e)
+                        failures[metric.data_type] = str(e)
+                        continue
+                    if counts is not None:
+                        metric_counts = counts if metric_counts is None else metric_counts + counts
+                if metric.data_type not in failures:
+                    succeeded += 1
+                if metric_counts is not None:
+                    results[metric.data_type] = metric_counts
 
         for derived in DERIVED_DAILY_METRICS:
             try:
